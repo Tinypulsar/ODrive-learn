@@ -844,6 +844,351 @@ Encoder ──pos_estimate──► Controller ──torque_output──► Moto
 
 ---
 
+### 第四部分：第一章自测回答与纠错
+
+> 以下是对 01-overview.md 末尾 5 个检验问题的自主回答，以及纠错记录。
+
+---
+
+#### 自测 Q1：ODrive 一共有哪些主要目录，每个是做什么的？
+
+**我的回答**：analysis（仿真）、docs（文档）、Firmware（算法文件）、GUI（调试交互）、tools（编译烧录工具）、Arduino（跨平台 Arduino 程序）。
+
+**纠错**：
+
+| 目录 | 我的理解 | 修正 |
+|------|---------|------|
+| Firmware | 电机驱动的关键算法文件 | **不仅仅是算法**，是整个嵌入式固件工程：算法（MotorControl/）+ 硬件驱动（Board/v3/、Drivers/）+ 通信协议（communication/）+ 第三方库（ThirdParty/）+ 接口定义（YAML）+ 构建脚本 |
+| tools | 编译、烧录或生成接口的工具 | **不是编译工具**，是 Python 上位机工具包（odrivetool 命令行、Fibre 协议、DFU 烧录脚本），给用户控制和调试 ODrive 用的。编译用的是系统工具链（gcc-arm、tup），不在 tools/ 里 |
+| Arduino | 跨平台的 Arduino 程序 | 不是"跨平台"，是一个 Arduino 通信库——让 Arduino 通过 UART/CAN 发命令给 ODrive，只是一层薄封装 |
+
+还漏了 **ThirdParty/** — 第三方依赖库（ST HAL、FreeRTOS、Fibre 协议栈等）。
+
+---
+
+#### 自测 Q2：固件是用什么构建的？
+
+**我的回答**：cpp 文件 → gcc-arm-none-eabi → Makefile 代理调用 tup → 可执行文件 → OpenOCD 烧录。
+
+**纠错**：
+- 核心链路正确，但输出不是"可执行文件"，而是 `.elf/.hex/.bin` 固件镜像（裸机程序）
+- 烧录有两种方式：OpenOCD（SWD 调试器）和 DFU（USB）
+- 支持多种板型（v3.2 ~ v3.6-56V），通过 `tup.config` 选择
+- 不仅是 cpp，还包括 `.c` 文件（HAL 驱动、FreeRTOS 都是纯 C）
+
+---
+
+#### 自测 Q3：上位机怎么"认识"固件里的属性？
+
+**我的回答**：可能是根据 odrive-interface.yaml 生成的一个枚举。
+
+**纠错**：方向正确但不完整。完整机制分三步：
+1. `odrive-interface.yaml` 定义所有属性/方法/枚举
+2. **构建时** Jinja2 模板同时生成 C++ 头文件 + Python 枚举 + CAN DBC
+3. **运行时** Python 通过 Fibre 协议"发现"固件中的端点树，建立对象映射
+
+不仅是枚举，而是整个接口树（属性 + 方法 + 类型）。
+
+---
+
+#### 自测 Q4：Axis 对象里有哪些子组件？怎么连起来的？
+
+**我的回答**：不确定，但猜测可能通过 YAML 连接？还是驱动库中的函数？
+
+**纠错**：YAML 只是**声明** Axis 有哪些子组件（静态关系），真正的数据连接在 C++ 代码中。
+
+子组件：Encoder、Controller、Motor(FOC)、SensorlessEstimator、TrapezoidalTrajectory、Endstop×2、MechanicalBrake
+
+连接方式：在 `axis.cpp` 的 `start_closed_loop_control()` 中通过 `connect_to()` 动态连接输入/输出端口：
+```cpp
+motor_.torque_setpoint_src_.connect_to(&controller_.torque_output_);
+controller_.vel_estimate_src_.connect_to(&encoder_.vel_estimate_);
+```
+**YAML 定义"有什么"，C++ 代码决定"怎么连"。**
+
+---
+
+#### 自测 Q5：从 USB 命令到电机转动，数据流经过哪些层？
+
+**我的回答**：上位机鼠标/键盘 → 指令 → USB 硬件层 → 驱动板 → 通信协议解析 → 执行。
+
+**纠错**：上半段基本对，但缺少了固件内部的控制算法链路（最核心的部分）。完整链路：
+
+```
+① Python: odrv0.axis0.controller.input_pos = 10.0
+   ↓ Fibre 打包：endpoint_id + float(10.0)
+② USB 传输: libusb → bulk transfer
+   ↓
+③ 固件 USB 中断: 解包 → 写入 controller_.input_pos_
+   ↓
+④ Controller::update() (8kHz)
+   ↓ 位置环(P): pos_err → vel_cmd
+   ↓ 速度环(PI): vel_err → torque_cmd
+⑤ Motor/FOC (8kHz)
+   ↓ torque → Iq → PI电流控制 → 逆Park → SVM → PWM
+⑥ 硬件: TIM → DRV8301 → 三相桥 → 电机转动
+```
+
+④⑤⑥是"协议解析"到"电机转动"之间的完整控制链路，恰恰是 ODrive 固件的核心。
+
+---
+
+### 第五部分：进阶问答（Q30 ~ Q33）
+
+---
+
+#### Q30：Fibre 协议介绍
+
+**Fibre** 是 ODrive 团队自研的轻量级二进制 RPC（远程过程调用）框架，专门解决一个问题：**让 Python 像操作本地对象一样操作固件中的变量**。
+
+**核心机制**：
+
+```
+Python 端                              固件端
+                                       
+odrv0.axis0.controller.input_pos       每个暴露的属性都有一个
+       │                               endpoint_id（端点编号）
+       │  "发现"协议                    
+       │  ← 获取所有端点的树形结构       endpoint 0: ODrive.vbus_voltage
+       │                               endpoint 1: ODrive.axis0.error
+       │  读/写操作                     endpoint 42: ...controller.input_pos
+       └─→ 二进制帧: [endpoint_id=42,   
+            payload=float(10.0)]        收到后直接写入对应内存地址
+```
+
+**协议分层**：
+
+| 层 | 职责 |
+|----|------|
+| 传输层 | USB bulk / UART / CAN（物理搬运字节） |
+| 帧层 | 序列号、CRC 校验、分包/重组 |
+| 端点层 | endpoint_id + 读/写操作 + payload |
+| 对象层 | 树形结构映射（`odrv0.axis0.controller...`） |
+
+**与常见协议的对比**：
+
+| | Fibre | Modbus | protobuf | REST API |
+|---|---|---|---|---|
+| 传输 | USB/UART/CAN | RS485 | TCP/UDP | HTTP |
+| 编码 | 二进制 | 二进制 | 二进制 | JSON/XML |
+| 自发现 | **有**（自动枚举端点） | 无 | 无 | 需文档 |
+| 开销 | 极小 | 小 | 小 | 大 |
+| 生态 | ODrive 专有 | 工业标准 | Google 标准 | 通用 |
+
+**Fibre 最大的特色是"自发现"**：Python 端连上 USB 后，自动获取固件中所有端点的名称、类型、读写权限，然后动态构建 Python 对象树。所以你可以 Tab 补全 `odrv0.axis0.controller.` 看到所有属性——这些信息是运行时从固件读取的。
+
+**你需要了解多少**：
+- 只是使用 ODrive → 不用管内部实现，用 `odrivetool` 就行
+- 想给固件加新属性 → 只需改 `odrive-interface.yaml`，Fibre 自动处理
+- 想写自己的通信协议 → 建议用更简单的 ASCII 或 CAN Simple，跳过 Fibre
+
+---
+
+#### Q31：Tup 是什么？跟 Keil 有什么区别？
+
+**Tup 是一种构建系统**，和 Make、CMake 是同类——它的职责是**决定"哪些文件需要用什么命令编译，以什么顺序"**，而不是自己做编译。
+
+**编译流程中各角色的职责**：
+
+```
+Tupfile.lua（构建脚本）
+  │  描述了：
+  │  - 哪些 .c/.cpp 文件要编译
+  │  - 用什么编译器（gcc-arm-none-eabi）
+  │  - 加什么编译选项（-mcpu=cortex-m4 -mfpu=fpv4-sp-d16）
+  │  - 最终链接成什么（ODriveFirmware.elf）
+  ▼
+Tup（构建系统）
+  │  做了：
+  │  - 扫描所有源文件的依赖关系
+  │  - 判断哪些文件被修改过，只重编这些（增量编译）
+  │  - 按正确顺序调用编译器
+  ▼
+gcc-arm-none-eabi（交叉编译器）
+  │  做了：
+  │  - 把 .c/.cpp 编译成 .o 目标文件
+  │  - 链接所有 .o 生成 .elf 固件
+  ▼
+ODriveFirmware.elf / .hex / .bin
+```
+
+**Tup 的优势——为什么不用 Make**：
+
+| | Make | Tup | CMake |
+|---|---|---|---|
+| 增量编译 | 基于时间戳，不够精确 | **基于文件内容哈希 + 依赖图**，极其精确 | 基于时间戳 |
+| 速度 | 大项目慢（总是全扫描） | **极快**（只检查变化的文件） | 中等 |
+| 配置文件 | Makefile（晦涩语法） | Tupfile.lua（Lua 脚本，可编程） | CMakeLists.txt |
+| 并行编译 | 需手动 `-j` | **自动最大并行** | 需手动 |
+
+**与 Keil 的本质区别**：
+
+```
+Keil = IDE + 编译器 + 链接器 + 调试器 + 构建系统（全家桶，一体化）
+     = armcc/armclang（Keil 自带的编译器）
+     + µVision（图形界面）
+     + 所有东西打包在一起
+
+ODrive 的方案 = 各组件独立、可替换：
+     Tup（构建系统）+ gcc-arm（编译器）+ OpenOCD（烧录）+ VS Code（编辑器）
+```
+
+| | Keil | ODrive 的工具链 |
+|---|---|---|
+| 编译器 | armcc / armclang（商用，需授权） | gcc-arm-none-eabi（**开源免费**） |
+| 构建管理 | µVision 内置 | Tup（开源） |
+| 调试器 | µVision + J-Link/ST-Link | OpenOCD + GDB（开源） |
+| 操作系统 | 仅 Windows | **Linux / macOS / Windows** |
+| 费用 | 商业授权（昂贵） | 全免费 |
+| 灵活性 | GUI 配置，封闭 | 脚本配置，完全可定制 |
+
+**为什么 ODrive 不用 Keil**：开源项目追求跨平台、免费、可 CI/CD 自动化。Keil 是商用封闭工具，不适合开源协作。
+
+---
+
+#### Q32：Docker 环境有什么作用？
+
+ODrive 仓库根目录有一个 `Dockerfile`，它的作用是**一键创建一个包含所有编译依赖的容器环境**。
+
+**解决的问题**：
+
+```
+没有 Docker：
+  你需要手动安装：gcc-arm-none-eabi、tup、python3、
+  pyyaml、jinja2、jsonschema、openocd...
+  → 不同系统版本不同、路径不同、依赖冲突
+  → "在我机器上能编译"但别人不行
+
+有 Docker：
+  docker build -t odrive .
+  docker run -v $(pwd):/ODrive odrive
+  → 自动安装所有依赖，保证环境一致
+  → 任何人、任何机器都能一键编译
+```
+
+**Dockerfile 实际做了什么**（基于 Ubuntu 18.04）：
+
+```dockerfile
+# 安装工具链
+apt-get install gcc-arm-embedded openocd tup python3.7 \
+                python3-yaml python3-jinja2 python3-jsonschema
+
+# 编译步骤
+python interface_generator_stub.py ...   # 1. 从 YAML 生成接口代码
+tup init && tup generate build.sh        # 2. Tup 生成编译脚本
+./build.sh                               # 3. 执行编译
+```
+
+**适用场景**：
+
+| 场景 | 用 Docker？ |
+|------|-----------|
+| CI/CD 自动化（GitHub Actions 自动编译） | **最适合** |
+| 不想装工具链，只想编译出固件 | **适合** |
+| 日常开发 + 调试 + 烧录 | 不太适合（不方便访问硬件） |
+| 你目前的 VMware 环境 | **不需要**（已经手动装好工具链了） |
+
+**对你来说**：你的 VMware Ubuntu 环境已经能编译和烧录了，Docker 暂时用不上。它主要是给其他贡献者或 CI 系统"零配置编译"用的。
+
+---
+
+#### Q33：仿真和分析脚本如何使用？如何利用它学习？
+
+`analysis/Simulation/MotorSim.py` 是一个**纯 Python 的 PMSM 电机仿真器**，用 Runge-Kutta 数值积分求解电机微分方程。
+
+**它能做什么**：
+
+```python
+# 创建一个 D5065 电机模型
+d5065 = motor(
+    J = 1e-4,          # 转动惯量 [kg·m²]
+    b_coulomb = 0,      # 库仑摩擦
+    b_viscous = 0.01,   # 粘性摩擦
+    R = 0.039,          # 相电阻 [Ω]
+    L_q = 1.57e-5,      # q 轴电感 [H]
+    L_d = 1.57e-5,      # d 轴电感 [H]
+    KV = 270,           # KV 值
+    pole_pairs = 7,     # 极对数
+    dT = 1/48000        # 仿真步长（与固件 PWM 频率一致）
+)
+
+# 给定输入：[负载力矩, Vd, Vq]
+u = [0, 0, 1]  # Vq=1V, 无负载
+
+# 仿真 0.25 秒
+data = d5065.simulate(t=timesteps, u=u, x0=[0,0,0,0])
+
+# 绘制结果：位置、速度、Id、Iq 随时间变化
+plt.plot(data)
+```
+
+**仿真器内部的微分方程**（这正是 FOC 的数学本质）：
+
+```
+电气方程（d/q 轴）：
+  dId/dt = Vd/Ld - R/Ld·Id + ωe·Lq/Ld·Iq
+  dIq/dt = Vq/Lq - R/Lq·Iq - ωe·Ld/Lq·Id - ωe·λm/Lq
+
+力矩方程：
+  T = 3/2·p·(λm·Iq + (Ld-Lq)·Id·Iq) - T_load
+
+机械方程：
+  dω/dt = (T - b_viscous·ω - b_coulomb·sign(ω)) / J
+```
+
+**如何利用它学习——四个递进阶段**：
+
+**阶段 1：理解 FOC 微分方程**
+```python
+# 直接运行看效果
+python MotorSim.py
+# 输出 4 张图：位置、速度、Id、Iq 随时间变化
+# 思考：为什么 Iq 先上升后稳定？为什么 Id ≈ 0？
+```
+
+**阶段 2：改参数看影响**
+```python
+# 改 Vq 从 1 到 5：电机转更快了吗？
+u = [0, 0, 5]
+
+# 加负载力矩：速度下降了吗？
+u = [0.1, 0, 1]
+
+# 改电阻：响应变慢了？
+R = 0.2  # 5 倍电阻
+
+# 改惯量：加速更慢了？
+J = 1e-3  # 10 倍惯量
+```
+
+**阶段 3：对比固件算法**
+```python
+# 仿真器的 diff_eqs() 对应固件中的：
+#   foc.cpp: Clarke/Park 变换 + PI 电流控制
+#   motor.cpp: 力矩 = torque_constant × Iq
+# 在仿真里加你自己的 PI 电流控制器，看它能否跟踪 Iq_setpoint
+```
+
+**阶段 4：验证新算法**
+```python
+# 在仿真里实现一个滑模观测器（SMO），替代 ODrive 的反电动势观测器
+# 对比两者在不同噪声水平下的相位估计精度
+# 确认可行后再移植到固件 C++ 代码中
+```
+
+**其他分析脚本**：
+
+| 脚本 | 用途 | 学习价值 |
+|------|------|---------|
+| `cogging_harmonics.py` | 分析齿槽力矩的谐波成分 | 理解抗齿槽补偿的原理 |
+| `ac_induction_motor.py` | 异步电机等效电路计算 | 理解 ACIM 与 PMSM 的区别 |
+| `filterpoles.py` | 滤波器极点分析 | 理解 PLL 带宽与稳定性 |
+| `thermistors.py` | 热敏电阻曲线拟合 | 理解温度保护的实现 |
+
+**建议学习顺序**：先在阶段四（学完 FOC 理论）后使用 `MotorSim.py`，那时你已经理解了 d/q 轴模型，看仿真代码会觉得"原来就是这几个方程"。
+
+---
+
 下一步 → [06-phase5-controller.md](06-phase5-controller.md)（上层控制器与状态机）
 
 上一步 ← [A2-qa-record.md](A2-qa-record.md)（学习问答记录）
