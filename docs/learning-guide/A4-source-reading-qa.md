@@ -454,6 +454,136 @@ if( xReturn == pdPASS )  // 空闲任务创建成功
 (void) result;         // 返回值不需要
 ```
 
+### Q47：`traceTASK_SWITCHED_IN()` 是什么？
+
+在 `FreeRTOS.h:312-315` 中定义：
+```c
+#ifndef traceTASK_SWITCHED_IN
+    #define traceTASK_SWITCHED_IN()
+#endif
+```
+
+**空宏（no-op）**——展开后什么都不做。这是 FreeRTOS 留给调试/追踪工具的钩子点（如 Tracealyzer、SEGGER SystemView），这些工具会重定义此宏，在每次任务切换时记录时间戳和任务 ID，用于可视化任务调度行为。ODrive 没有使用追踪工具，所以它是空的。
+
+---
+
+## 四、ODrive 在 FreeRTOS 上的实际运行架构（Q48）
+
+> `vTaskStartScheduler()` 是 FreeRTOS 通用代码，跟 ODrive 业务无关。ODrive 真正的逻辑全部运行在 FreeRTOS 提供的"容器"里——中断和线程。
+
+---
+
+### Q48：ODrive 的关键函数及调用关系
+
+#### 完整调用链
+
+```
+硬件定时器 TIM8 更新中断（最高优先级，每个 PWM 周期触发两次）
+│
+└─ TIM8_UP_TIM13_IRQHandler()              [board.cpp:477]
+    │
+    ├─ 上升计数时（采样真实电流的时刻）：
+    │   ├─ odrv.sampling_cb()              [main.cpp:341] ← 编码器采样
+    │   └─ NVIC->STIR = ControlLoop_IRQn   ← 软件触发控制环中断
+    │       │
+    │       └─ ControlLoop_IRQHandler()    [board.cpp:518]（优先级 5）
+    │           ├─ fetch_and_reset_adcs()    ← 读取 ADC 电流值
+    │           ├─ motor.current_meas_cb()   ← 电流测量回调
+    │           └─ odrv.control_loop_cb()  [main.cpp:364] ← ★ 核心控制环 ★
+    │               ├─ 重置所有 OutputPort
+    │               ├─ uart_poll()
+    │               ├─ endstop.update()
+    │               ├─ do_checks() + watchdog_check()
+    │               ├─ thermistor.update()
+    │               ├─ encoder.update()        ← 编码器估计位置/速度
+    │               ├─ sensorless_estimator.update()
+    │               ├─ controller.update()     ← ★ PID 控制器 ★
+    │               ├─ open_loop_controller.update()
+    │               ├─ motor.update()          ← 扭矩→电压转换
+    │               ├─ current_control.update() ← ★ FOC 电流环 ★
+    │               └─ osSignalSet(axis.thread, 0x0001)  ← 通知 Axis 线程
+    │
+    └─ 下降计数时：
+        └─ 重置 PWM 占空比到 50%（安全默认值）
+
+────────────── 以上是中断层，以下是线程层 ──────────────
+
+Axis 线程（高优先级）                       [axis.cpp:455]
+│  for(;;) {
+│    ├─ 收到 requested_state_ → 构建 task_chain_[]
+│    ├─ switch(current_state_):
+│    │   ├─ MOTOR_CALIBRATION      → motor.run_calibration()
+│    │   ├─ ENCODER_INDEX_SEARCH   → encoder.run_index_search()
+│    │   ├─ ENCODER_OFFSET_CALIB   → encoder.run_offset_calibration()
+│    │   ├─ CLOSED_LOOP_CONTROL    → run_closed_loop_control_loop()
+│    │   │   └─ while(armed) { osDelay(1); }  ← 等待，控制在中断里跑
+│    │   └─ IDLE                   → run_idle_loop()
+│    │       └─ while(no_request) { motor.setup(); osDelay(1); }
+│    └─ 失败→回IDLE / 成功→下一个状态
+│  }
+
+USB 线程（Normal 优先级）           [interface_usb.cpp:157]
+│  for(;;) {
+│    ├─ osMessageGet(usb_event_queue)  ← 阻塞等待 USB 事件
+│    └─ 处理连接/断开/数据收发（Fibre / ASCII 协议）
+│  }
+
+UART 线程（Normal 优先级）          [interface_uart.cpp]
+│  for(;;) {
+│    ├─ osMessageGet(uart_event_queue)  ← 阻塞等待 UART 事件
+│    └─ 处理 ASCII / Fibre 协议命令
+│  }
+
+CAN 线程（Normal 优先级）           [odrive_can.cpp]
+│  for(;;) {
+│    ├─ osSemaphoreWait(sem_can)  ← 阻塞等待 CAN 中断
+│    └─ 处理 CAN Simple 协议命令
+│  }
+
+Analog 线程（Low 优先级）           [low_level.cpp:408]
+│  for(;;) {
+│    ├─ ADC 轮询采集（GPIO 模拟输入、温度）
+│    └─ osDelay(10)
+│  }
+
+Idle Hook（最低优先级，无线程）      [main.cpp:261]
+│  系统统计：堆栈水位、运行时间、LED 状态
+```
+
+#### 应重点阅读的 ODrive 关键函数
+
+按重要性排序：
+
+| 优先级 | 函数 | 文件 | 为什么重要 |
+|--------|------|------|-----------|
+| **1** | `control_loop_cb()` | main.cpp:364 | 整个控制链的总调度——每个 PWM 周期执行一次，依次调用编码器→控制器→电机→电流环 |
+| **2** | `Controller::update()` | controller.cpp | PID 控制器核心——位置环→速度环→力矩输出的级联计算 |
+| **3** | `Motor::update()` | motor.cpp | 扭矩到电压的转换（FOC 正变换） |
+| **4** | `CurrentControl::update()` | motor.cpp | FOC 电流环——Park/Clarke 变换、PI 调节器、SVPWM |
+| **5** | `Encoder::update()` | encoder.cpp | 编码器信号处理、PLL 速度估计 |
+| **6** | `run_state_machine_loop()` | axis.cpp:455 | 状态机——理解校准流程和状态转换 |
+| **7** | `TIM8_UP_TIM13_IRQHandler()` | board.cpp:477 | 中断入口——理解采样时序和控制环触发机制 |
+| **8** | `start_closed_loop_control()` | axis.cpp:257 | OutputPort 的 `connect_to()` 在这里建立——理解数据流如何动态连接 |
+
+#### 核心设计思想
+
+**控制算法全部在中断里执行，线程只做状态管理和慢速操作。**
+
+```
+TIM8 中断（8kHz）
+  └─ control_loop_cb()
+       └─ encoder.update() → controller.update() → motor.update() → current_control.update()
+          （整条链在一次中断内完成，约 20-30μs）
+
+Axis 线程（高优先级）
+  └─ 收到 osSignalSet 通知后，只做状态判断（是否有错误、是否需要切换状态）
+     实际的控制计算已经在中断里做完了
+```
+
+闭环控制时，`run_closed_loop_control_loop()` 的循环体只有 `osDelay(1)`——线程在**空转等待**，真正干活的是中断里的 `control_loop_cb()`。线程的角色更像"监工"，中断才是"工人"。
+
+**建议阅读顺序**：先看 `control_loop_cb()`（理解每个控制周期做了什么），再看 `Controller::update()`（理解 PID 控制器），然后看 `axis.cpp` 的状态机（理解校准和状态转换流程）。
+
 ---
 
 下一步 → 继续阅读 Axis 状态机代码 (`axis.cpp`)
